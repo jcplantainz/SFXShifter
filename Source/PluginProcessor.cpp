@@ -1,58 +1,197 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+static constexpr double twoPi = juce::MathConstants<double>::twoPi;
+
 SFXShifterAudioProcessor::SFXShifterAudioProcessor()
     : AudioProcessor(BusesProperties()
         .withInput("Input", juce::AudioChannelSet::stereo(), true)
-        .withOutput("Output", juce::AudioChannelSet::stereo(), true))
+        .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      fft(fftOrder)
 {
 }
 
 SFXShifterAudioProcessor::~SFXShifterAudioProcessor() {}
 
-void SFXShifterAudioProcessor::resetStretcher()
+void SFXShifterAudioProcessor::initChannelState(ChannelState& ch)
 {
-    RubberBand::RubberBandStretcher::Options options =
-        RubberBand::RubberBandStretcher::OptionProcessRealTime |
-        RubberBand::RubberBandStretcher::OptionStretchPrecise |
-        RubberBand::RubberBandStretcher::OptionTransientsCrisp;
+    ch.inputBuffer.assign(fftSize * 4, 0.0f);
+    ch.outputBuffer.assign(fftSize * 4, 0.0f);
+    ch.inputWritePos = 0;
+    ch.outputReadPos = 0;
 
-    stretcher = std::make_unique<RubberBand::RubberBandStretcher>(
-        (size_t)currentSampleRate,
-        (size_t)getTotalNumInputChannels(),
-        options
-    );
+    ch.lastPhase.assign(fftSize / 2 + 1, 0.0f);
+    ch.sumPhase.assign(fftSize / 2 + 1, 0.0f);
 
-    smoothedSpeed = (double)speedValue.load();
-    smoothedPitch = (double)pitchValue.load();
+    ch.fftWindow.resize(fftSize);
+    ch.fftWorkspace.assign(fftSize * 2, 0.0f);
+    ch.magnitude.assign(fftSize / 2 + 1, 0.0f);
+    ch.frequency.assign(fftSize / 2 + 1, 0.0f);
+    ch.synthMagnitude.assign(fftSize / 2 + 1, 0.0f);
+    ch.synthFrequency.assign(fftSize / 2 + 1, 0.0f);
 
-    // Only set time ratio if slowing down
-    // For speed-up we handle it manually
-    double timeRatio = smoothedSpeed <= 1.0 ? (1.0 / smoothedSpeed) : 1.0;
-    stretcher->setTimeRatio(timeRatio);
-    stretcher->setPitchScale(std::pow(2.0, smoothedPitch / 12.0));
-
-    startupSamplesRemaining = (int)stretcher->getLatency();
-    skipAccumulator = 0.0;
+    // Build Hann window
+    // Hann window reduces spectral leakage between FFT frames
+    for (int i = 0; i < fftSize; ++i)
+        ch.fftWindow[i] = 0.5f * (1.0f - std::cos(twoPi * i / (fftSize - 1)));
 }
 
 void SFXShifterAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
-    currentBlockSize = samplesPerBlock;
-
-    double smoothingMs = 80.0;
-    double samplesPerMs = sampleRate / 1000.0;
-    speedSmoothing = 1.0 - (1.0 / (smoothingMs * samplesPerMs));
-    pitchSmoothing = speedSmoothing;
-
     isPlaying = false;
-    resetStretcher();
+    speedAccumulator = 0.0;
+    smoothedSpeed = 1.0;
+    smoothedPitch = 0.0;
+
+    int numChannels = juce::jmax(getTotalNumInputChannels(),
+                                  getTotalNumOutputChannels());
+    channels.resize(numChannels);
+    for (auto& ch : channels)
+        initChannelState(ch);
 }
 
 void SFXShifterAudioProcessor::releaseResources()
 {
-    stretcher.reset();
+    channels.clear();
+}
+
+void SFXShifterAudioProcessor::processChannel(
+    ChannelState& ch,
+    float* data,
+    int numSamples,
+    double speed,
+    double pitchShift)
+{
+    // pitchShift is in semitones, convert to ratio
+    double pitchRatio = std::pow(2.0, pitchShift / 12.0);
+
+    // Expected phase advance per hop per bin
+    // This is the "true frequency" of each bin at the nominal sample rate
+    double phaseAdvancePerBin = twoPi * hopSize / fftSize;
+
+    int bufSize = (int)ch.inputBuffer.size();
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        // Write incoming sample into circular input buffer
+        ch.inputBuffer[ch.inputWritePos] = data[i];
+        ch.inputWritePos = (ch.inputWritePos + 1) % bufSize;
+
+        // Accumulate speed — when we have enough samples for a hop, process a frame
+        speedAccumulator += speed;
+
+        while (speedAccumulator >= 1.0)
+        {
+            speedAccumulator -= 1.0;
+
+            // --- ANALYSIS FRAME ---
+            // Copy fftSize samples from input buffer into FFT workspace
+            // Apply Hann window to reduce spectral leakage
+            for (int k = 0; k < fftSize; ++k)
+            {
+                int readPos = (ch.inputWritePos - fftSize + k + bufSize) % bufSize;
+                ch.fftWorkspace[k * 2]     = ch.inputBuffer[readPos] * ch.fftWindow[k];
+                ch.fftWorkspace[k * 2 + 1] = 0.0f; // imaginary part = 0 for real input
+            }
+
+            // Forward FFT — converts time domain to frequency domain
+            fft.performRealOnlyForwardTransform(ch.fftWorkspace.data());
+
+            // --- PHASE VOCODER ANALYSIS ---
+            // For each frequency bin, calculate the true frequency
+            // by comparing the phase to what we'd expect
+            int numBins = fftSize / 2 + 1;
+            for (int k = 0; k < numBins; ++k)
+            {
+                float real = ch.fftWorkspace[k * 2];
+                float imag = ch.fftWorkspace[k * 2 + 1];
+
+                // Get magnitude and phase
+                float mag = std::sqrt(real * real + imag * imag);
+                float phase = std::atan2(imag, real);
+
+                // Calculate phase difference from last frame
+                double phaseDiff = phase - ch.lastPhase[k];
+                ch.lastPhase[k] = phase;
+
+                // Subtract expected phase advance
+                double expectedAdvance = k * phaseAdvancePerBin;
+                phaseDiff -= expectedAdvance;
+
+                // Wrap phase difference to [-pi, pi]
+                phaseDiff = phaseDiff - twoPi * std::round(phaseDiff / twoPi);
+
+                // Calculate true frequency of this bin
+                // (may differ from bin center due to pitch content)
+                double trueFreq = (k + phaseDiff / phaseAdvancePerBin)
+                                  * (twoPi * hopSize / fftSize);
+
+                ch.magnitude[k] = mag;
+                ch.frequency[k] = (float)trueFreq;
+            }
+
+            // --- PITCH SHIFTING ---
+            // Redistribute energy across bins according to pitch ratio
+            // This is where the actual pitch shift happens
+            std::fill(ch.synthMagnitude.begin(), ch.synthMagnitude.end(), 0.0f);
+            std::fill(ch.synthFrequency.begin(), ch.synthFrequency.end(), 0.0f);
+
+            for (int k = 0; k < numBins; ++k)
+            {
+                // Calculate destination bin after pitch shift
+                int destBin = (int)std::round(k * pitchRatio);
+
+                if (destBin >= 0 && destBin < numBins)
+                {
+                    // Accumulate magnitude — multiple source bins
+                    // can map to the same destination bin
+                    if (ch.magnitude[k] > ch.synthMagnitude[destBin])
+                    {
+                        ch.synthMagnitude[destBin] = ch.magnitude[k];
+                        ch.synthFrequency[destBin] = (float)(ch.frequency[k] * pitchRatio);
+                    }
+                }
+            }
+
+            // --- PHASE VOCODER SYNTHESIS ---
+            // Accumulate synthesis phase using true frequencies
+            for (int k = 0; k < numBins; ++k)
+            {
+                ch.sumPhase[k] += (float)ch.synthFrequency[k];
+
+                float mag   = ch.synthMagnitude[k];
+                float phase = ch.sumPhase[k];
+
+                // Convert back to real/imaginary
+                ch.fftWorkspace[k * 2]     = mag * std::cos(phase);
+                ch.fftWorkspace[k * 2 + 1] = mag * std::sin(phase);
+            }
+
+            // Inverse FFT — converts back to time domain
+            fft.performRealOnlyInverseTransform(ch.fftWorkspace.data());
+
+            // --- OVERLAP-ADD ---
+            // Add the windowed output frame to the output buffer
+            // The overlap-add process reconstructs the continuous audio signal
+            float windowSum = 0.0f;
+            for (int k = 0; k < fftSize; ++k)
+                windowSum += ch.fftWindow[k] * ch.fftWindow[k];
+            float normalise = hopSize / (windowSum * fftSize);
+
+            for (int k = 0; k < fftSize; ++k)
+            {
+                int writePos = (ch.outputReadPos + k) % bufSize;
+                ch.outputBuffer[writePos] +=
+                    ch.fftWorkspace[k * 2] * ch.fftWindow[k] * normalise;
+            }
+        }
+
+        // Read output sample
+        data[i] = ch.outputBuffer[ch.outputReadPos];
+        ch.outputBuffer[ch.outputReadPos] = 0.0f;
+        ch.outputReadPos = (ch.outputReadPos + 1) % bufSize;
+    }
 }
 
 void SFXShifterAudioProcessor::processBlock(
@@ -60,20 +199,20 @@ void SFXShifterAudioProcessor::processBlock(
 {
     juce::ScopedNoDenormals noDenormals;
 
-    if (!stretcher) return;
-
+    // Check playhead
     auto* playHead = getPlayHead();
     bool hostIsPlaying = false;
 
     if (playHead != nullptr)
-    {
         if (auto position = playHead->getPosition())
             hostIsPlaying = position->getIsPlaying();
-    }
 
     if (!hostIsPlaying && isPlaying)
     {
-        resetStretcher();
+        // Reset state on stop
+        for (auto& ch : channels)
+            initChannelState(ch);
+        speedAccumulator = 0.0;
         buffer.clear();
         isPlaying = false;
         return;
@@ -87,156 +226,22 @@ void SFXShifterAudioProcessor::processBlock(
 
     isPlaying = true;
 
+    // Smooth parameters to avoid abrupt changes
     double targetSpeed = (double)speedValue.load();
     double targetPitch = (double)pitchValue.load();
+    smoothedSpeed = smoothedSpeed * 0.95 + targetSpeed * 0.05;
+    smoothedPitch = smoothedPitch * 0.95 + targetPitch * 0.05;
 
-    smoothedSpeed = smoothedSpeed * speedSmoothing + targetSpeed * (1.0 - speedSmoothing);
-    smoothedPitch = smoothedPitch * pitchSmoothing + targetPitch * (1.0 - pitchSmoothing);
+    int numChannels = juce::jmin((int)channels.size(),
+                                  buffer.getNumChannels());
 
-    smoothedSpeed = juce::jlimit(0.5, 2.0, smoothedSpeed);
-    smoothedPitch = juce::jlimit(-12.0, 12.0, smoothedPitch);
-
-    int numChannels = buffer.getNumChannels();
-    int numSamples = buffer.getNumSamples();
-
-    if (smoothedSpeed > 1.0)
+    for (int c = 0; c < numChannels; ++c)
     {
-        // --- SPEED UP PATH: sample skipping + pitch shift ---
-
-        // Apply pitch shift via Rubber Band with time ratio = 1.0
-        stretcher->setTimeRatio(1.0);
-        stretcher->setPitchScale(std::pow(2.0, smoothedPitch / 12.0));
-
-        // Build a compressed input buffer by skipping samples
-        // e.g. at 2x speed we keep every other sample
-        int compressedSize = juce::jmax(1,
-            (int)std::round(numSamples / smoothedSpeed));
-
-        juce::AudioBuffer<float> compressedBuffer(numChannels, compressedSize);
-
-        for (int c = 0; c < numChannels; ++c)
-        {
-            const float* src = buffer.getReadPointer(c);
-            float* dst = compressedBuffer.getWritePointer(c);
-
-            for (int i = 0; i < compressedSize; ++i)
-            {
-                // Linear interpolation for smoother sample skipping
-                double srcPos = (double)i * smoothedSpeed;
-                int srcIdx = (int)srcPos;
-                double frac = srcPos - srcIdx;
-
-                int nextIdx = juce::jmin(srcIdx + 1, numSamples - 1);
-                dst[i] = (float)((1.0 - frac) * src[srcIdx] + frac * src[nextIdx]);
-            }
-        }
-
-        // Feed compressed buffer through Rubber Band for pitch only
-        std::vector<const float*> inputPtrs(numChannels);
-        for (int c = 0; c < numChannels; ++c)
-            inputPtrs[c] = compressedBuffer.getReadPointer(c);
-
-        stretcher->process(inputPtrs.data(), (size_t)compressedSize, false);
-
-        // Retrieve output
-        int available = (int)stretcher->available();
-
-        if (startupSamplesRemaining > 0)
-        {
-            int toDiscard = std::min(startupSamplesRemaining, available);
-            if (toDiscard > 0)
-            {
-                std::vector<std::vector<float>> drain(numChannels,
-                    std::vector<float>(toDiscard, 0.0f));
-                std::vector<float*> drainPtrs(numChannels);
-                for (int c = 0; c < numChannels; ++c)
-                    drainPtrs[c] = drain[c].data();
-                stretcher->retrieve(drainPtrs.data(), (size_t)toDiscard);
-                startupSamplesRemaining -= toDiscard;
-            }
-            buffer.clear();
-            return;
-        }
-
-        if (available > 0)
-        {
-            int toRetrieve = std::min(available, numSamples);
-
-            // Retrieve into a temp buffer then stretch back to full size
-            juce::AudioBuffer<float> tempOut(numChannels, toRetrieve);
-            std::vector<float*> outPtrs(numChannels);
-            for (int c = 0; c < numChannels; ++c)
-                outPtrs[c] = tempOut.getWritePointer(c);
-
-            stretcher->retrieve(outPtrs.data(), (size_t)toRetrieve);
-
-            // Copy to output, padding or truncating as needed
-            for (int c = 0; c < numChannels; ++c)
-            {
-                const float* src = tempOut.getReadPointer(c);
-                float* dst = buffer.getWritePointer(c);
-                int toCopy = std::min(toRetrieve, numSamples);
-                std::copy(src, src + toCopy, dst);
-                if (toCopy < numSamples)
-                    std::fill(dst + toCopy, dst + numSamples, 0.0f);
-            }
-        }
-        else
-        {
-            buffer.clear();
-        }
-    }
-    else
-    {
-        // --- SLOW DOWN PATH: full Rubber Band time stretching ---
-
-        stretcher->setTimeRatio(1.0 / smoothedSpeed);
-        stretcher->setPitchScale(std::pow(2.0, smoothedPitch / 12.0));
-
-        std::vector<const float*> inputPtrs(numChannels);
-        for (int c = 0; c < numChannels; ++c)
-            inputPtrs[c] = buffer.getReadPointer(c);
-
-        stretcher->process(inputPtrs.data(), (size_t)numSamples, false);
-
-        int available = (int)stretcher->available();
-
-        if (startupSamplesRemaining > 0)
-        {
-            int toDiscard = std::min(startupSamplesRemaining, available);
-            if (toDiscard > 0)
-            {
-                std::vector<std::vector<float>> drain(numChannels,
-                    std::vector<float>(toDiscard, 0.0f));
-                std::vector<float*> drainPtrs(numChannels);
-                for (int c = 0; c < numChannels; ++c)
-                    drainPtrs[c] = drain[c].data();
-                stretcher->retrieve(drainPtrs.data(), (size_t)toDiscard);
-                startupSamplesRemaining -= toDiscard;
-            }
-            buffer.clear();
-            return;
-        }
-
-        if (available > 0)
-        {
-            int toRetrieve = std::min(available, numSamples);
-            std::vector<float*> outputPtrs(numChannels);
-            for (int c = 0; c < numChannels; ++c)
-                outputPtrs[c] = buffer.getWritePointer(c);
-
-            stretcher->retrieve(outputPtrs.data(), (size_t)toRetrieve);
-
-            if (toRetrieve < numSamples)
-            {
-                for (int c = 0; c < numChannels; ++c)
-                    buffer.clear(c, toRetrieve, numSamples - toRetrieve);
-            }
-        }
-        else
-        {
-            buffer.clear();
-        }
+        processChannel(channels[c],
+                       buffer.getWritePointer(c),
+                       buffer.getNumSamples(),
+                       smoothedSpeed,
+                       smoothedPitch);
     }
 }
 
